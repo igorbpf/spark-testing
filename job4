@@ -1,0 +1,103 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.window import Window
+from pyspark.sql.functions import col, lead, lit
+
+
+spark.sparkContext.addPyFile("s3://spinyleaks-lake/jars/graphframes-0.8.1-spark3.0-s_2.12.jar")
+
+from graphframes import GraphFrame
+
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+dyf = glueContext.create_dynamic_frame.from_catalog(
+    database='glue_database',
+    table_name='user_navigation',
+    predicate_push_down=202311
+)
+
+dyf.printSchema()
+df = dyf.toDF()
+df.show()
+# Create Vertices DataFrame
+vertices = df.selectExpr("screen_name as id", "screen_name", "jornada").distinct()
+
+vertices.show()
+# Define a window spec for ordering events within each user session
+windowSpec = Window.partitionBy("customer_id", "session").orderBy("hitnumber")
+
+# Create Edges DataFrame
+edges = df.withColumn("dst", lead("screen_name").over(windowSpec)) \
+    .select("customer_id", "screen_name", "dst", "session", "hitnumber") \
+    .withColumnRenamed("screen_name", "src") \
+    .withColumnRenamed("hitnumber", "step") \
+    .filter(col("dst").isNotNull())
+edges.show()
+# Initialize GraphFrame
+g = GraphFrame(vertices, edges)
+# Define target screen and maximum path length
+target_screen = "Apply for Credit 3"
+max_length = 5
+# Initialize an empty DataFrame to store results
+all_paths = []
+
+# Iteratively explore paths of increasing lengths
+for length in range(1, max_length + 1):
+    pattern = "".join([f"(v{i})-[e{i}]->(v{i+ 1});" for i in range(length)])
+    pattern = pattern[:-1]
+    print(pattern)
+    filter_step = " and ".join([f"e{i}.step = {i + 1}" for i in range(length)])
+    print(filter_step)
+    filter_user = " and ".join([f"e{i}.session = e{i + 1}.session" for i in range(length - 1)])
+    print(filter_user)
+    print("**********")
+    paths = g.find(pattern).filter(f"v{length}.id = '{target_screen}'")
+    paths = paths.withColumn("path_length", lit(length))
+
+    if len(filter_user):
+        paths = paths.filter(filter_user)
+    
+    if len(filter_step):
+        paths = paths.filter(filter_step)
+    
+    
+    all_paths.append(paths)
+    
+    # if all_paths is None:
+    #     all_paths = paths
+    # else:
+    #     all_paths = all_paths.union(paths)
+len(all_paths)
+all_paths[4].show()
+pattern = "(v0)-[e0]->(v1);(v1)-[e1]->(v2)"
+filter_step = "e0.step = 1 and e1.step = 2"
+filter_user = "e0.session = e1.session"
+
+paths = g.find(pattern).filter(f"v2.id = '{target_screen}'").filter(filter_user).filter(filter_step)
+paths = paths.withColumn("path_length", lit(2))
+
+paths.show()
+paths.select('e0').show(truncate=False)
+all_paths[4].show()
+s3output = glueContext.getSink(
+  path="s3://bucket_name/folder_name",
+  connection_type="s3",
+  updateBehavior="UPDATE_IN_DATABASE",
+  partitionKeys=[],
+  compression="snappy",
+  enableUpdateCatalog=True,
+  transformation_ctx="s3output",
+)
+s3output.setCatalogInfo(
+  catalogDatabase="demo", catalogTableName="populations"
+)
+s3output.setFormat("glueparquet")
+s3output.writeFrame(DyF)
+job.commit()
